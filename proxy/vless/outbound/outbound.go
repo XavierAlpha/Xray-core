@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xctx "github.com/xtls/xray-core/common/ctx"
+	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
@@ -55,14 +56,104 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre  uint32
-	initpre  sync.Once
-	preConns chan *ConnExpire
+	testpre   uint32
+	initpre   sync.Once
+	preConns  chan preConn
+	preRefill chan struct{}
+	preCancel context.CancelFunc
+	preWG     sync.WaitGroup
+	preMu     sync.Mutex
+	preFails  int
+	preNext   time.Time
+	preRun    int
 }
 
-type ConnExpire struct {
-	Conn   stat.Connection
-	Expire time.Time
+type preConn struct {
+	conn stat.Connection
+	exp  int64
+}
+
+const (
+	preTTL       = 2 * time.Minute
+	preRetryMin  = 200 * time.Millisecond
+	preRetryMax  = 2 * time.Minute
+	preJitterPct = 25
+)
+
+func refill(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	delta := d * preJitterPct / 100
+	if delta <= 0 {
+		return d
+	}
+	off := time.Duration(dice.Roll(int(delta*2+1))) - delta
+	return d + off
+}
+
+func preBackoff(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	gap := preRetryMin
+	for i := 1; i < fails && gap < preRetryMax; i++ {
+		gap *= 2
+		if gap >= preRetryMax {
+			return preRetryMax
+		}
+	}
+	return gap
+}
+
+func (h *Handler) preAcquire(now time.Time) time.Duration {
+	h.preMu.Lock()
+	defer h.preMu.Unlock()
+	if h.preFails > 0 {
+		if now.Before(h.preNext) {
+			return h.preNext.Sub(now)
+		}
+		if h.preRun > 0 {
+			return preRetryMin
+		}
+	} else if h.preRun >= int(h.testpre) {
+		return preRetryMin
+	}
+	h.preRun++
+	return 0
+}
+
+func (h *Handler) preRelease() {
+	h.preMu.Lock()
+	defer h.preMu.Unlock()
+	if h.preRun > 0 {
+		h.preRun--
+	}
+}
+
+func (h *Handler) preFinish(now time.Time, ok bool) (time.Duration, int, bool) {
+	h.preMu.Lock()
+	defer h.preMu.Unlock()
+	if h.preRun > 0 {
+		h.preRun--
+	}
+	if ok {
+		recovered := h.preFails > 0
+		h.preFails = 0
+		h.preNext = time.Time{}
+		return 0, 0, recovered
+	}
+	h.preFails++
+	gap := preBackoff(h.preFails)
+	h.preNext = now.Add(jitter(gap))
+	return h.preNext.Sub(now), h.preFails, false
 }
 
 // New creates a new VLess outbound handler.
@@ -123,6 +214,10 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
+	if h.preCancel != nil {
+		h.preCancel()
+	}
+	h.preWG.Wait()
 	if h.preConns != nil {
 		close(h.preConns)
 	}
@@ -146,37 +241,93 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
-			h.preConns = make(chan *ConnExpire)
-			for range h.testpre { // TODO: randomize
+			h.preConns = make(chan preConn, int(h.testpre))
+			h.preRefill = make(chan struct{}, int(h.testpre))
+			errors.LogInfo(ctx, "pre-connect state=enabled pool=", h.testpre, ", ttl=", preTTL, ", cooldown=", preRetryMin, "~", preRetryMax)
+			preCtx, cancel := context.WithCancel(xctx.ContextWithID(context.Background(), session.NewID()))
+			h.preCancel = cancel
+			for range h.testpre {
+				h.preWG.Add(1)
 				go func() {
-					defer func() { recover() }()
-					ctx := xctx.ContextWithID(context.Background(), session.NewID())
+					defer h.preWG.Done()
 					for {
-						conn, err := dialer.Dial(ctx, rec.Destination)
-						if err != nil {
-							errors.LogWarningInner(ctx, err, "pre-connect failed")
+						select {
+						case <-preCtx.Done():
+							errors.LogDebug(preCtx, "pre-connect state=stopped reason=canceled")
+							return
+						case <-h.preRefill:
+						}
+						if len(h.preConns) >= cap(h.preConns) {
 							continue
 						}
-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
+						for {
+							wait := h.preAcquire(time.Now())
+							if wait == 0 {
+								break
+							}
+							select {
+							case <-preCtx.Done():
+								errors.LogDebug(preCtx, "pre-connect state=stopped reason=canceled")
+								return
+							case <-time.After(jitter(wait)):
+							}
+						}
+						conn, err := dialer.Dial(preCtx, rec.Destination)
+						if err != nil {
+							if preCtx.Err() != nil {
+								h.preRelease()
+								errors.LogDebug(preCtx, "pre-connect state=stopped reason=canceled")
+								return
+							}
+							wait, fails, _ := h.preFinish(time.Now(), false)
+							if fails == 1 {
+								errors.LogWarningInner(preCtx, err, "pre-connect state=degraded fail=", fails, ", next=", wait)
+							} else {
+								errors.LogDebugInner(preCtx, err, "pre-connect state=retry fail=", fails, ", next=", wait)
+							}
+							refill(h.preRefill)
+							continue
+						}
+						_, _, recovered := h.preFinish(time.Now(), true)
+						if recovered {
+							errors.LogInfo(preCtx, "pre-connect state=recovered ready=", len(h.preConns), "/", cap(h.preConns))
+						}
+						pc := preConn{conn: conn, exp: time.Now().Add(jitter(preTTL)).UnixNano()}
+						select {
+						case <-preCtx.Done():
+							conn.Close()
+							errors.LogDebug(preCtx, "pre-connect state=stopped reason=canceled")
+							return
+						case h.preConns <- pc:
+						default:
+							conn.Close()
+						}
 					}
 				}()
 			}
+			for range h.testpre {
+				refill(h.preRefill)
+			}
 		})
-		for {
-			connTime := <-h.preConns
-			if connTime == nil {
-				return errors.New("closed handler").AtWarning()
+		for conn == nil {
+			select {
+			case <-ctx.Done():
+				errors.LogInfoInner(ctx, ctx.Err(), "pre-connect state=canceled while=request_wait")
+				return errors.New("pre-connect canceled").Base(ctx.Err()).AtWarning()
+			case pc, ok := <-h.preConns:
+				if !ok {
+					errors.LogWarning(ctx, "pre-connect state=closed")
+					return errors.New("closed handler").AtWarning()
+				}
+				refill(h.preRefill)
+				if time.Now().UnixNano() < pc.exp {
+					conn = pc.conn
+					continue
+				}
+				pc.conn.Close()
 			}
-			if time.Now().Before(connTime.Expire) {
-				conn = connTime.Conn
-				break
-			}
-			connTime.Conn.Close()
 		}
-	}
-
-	if conn == nil {
+	} else {
 		if err := retry.ExponentialBackoff(5, 200).On(func() error {
 			var err error
 			conn, err = dialer.Dial(ctx, rec.Destination)
